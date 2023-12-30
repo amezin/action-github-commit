@@ -1,7 +1,7 @@
 import fs from 'fs';
 
 import * as core from '@actions/core';
-import {exec} from '@actions/exec';
+import {getExecOutput} from '@actions/exec';
 import * as github from '@actions/github';
 
 async function run(): Promise<void> {
@@ -9,7 +9,7 @@ async function run(): Promise<void> {
     const {owner, repo} = github.context.repo;
     const token = core.getInput('github-token');
     const message = core.getInput('message') || 'Default commit message';
-    const branchName = process.env.GITHUB_HEAD_REF || 'master';
+    const branchName = process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF;
 
     if (!token) {
       core.setFailed('GitHub token not found');
@@ -18,38 +18,13 @@ async function run(): Promise<void> {
 
     const octokit = github.getOctokit(token); // might fail with an auth error?
 
-
     // Find updated file contents using the `git` cli.
     // ===============================================
-
-    let gitOutput = '';
-    let gitError = '';
-
-    await exec('git', ['ls-files', '-om', '--exclude-standard'], {
-      silent: true,
-      listeners: {
-        stdout: (data: Buffer) => {
-          gitOutput += data.toString();
-        },
-        stderr: (data: Buffer) => {
-          gitError += data.toString();
-        },
-      },
+    const lsFiles = await getExecOutput('git', ['ls-files', '-om', '--exclude-standard'], {
+      failOnStderr: true
     });
 
-    core.debug('🐭🐭🐭🐭🐭 gitOutput vvv');
-    core.debug(gitOutput);
-    core.debug('🐱🐱🐱🐱🐱 ^^^ gitOutput');
-
-    if (!gitOutput) {
-      return;  // This action is a no-op if there are no changes.
-    }
-    if (gitError) {
-      core.setFailed(`git stderr: ${gitError}`);
-      return;
-    }
-
-    const files = gitOutput.split('\n');
+    const files = lsFiles.stdout.split('\n');
     const newContents = [];
     for (const path of files) {
       if (!path.trim())
@@ -63,6 +38,17 @@ async function run(): Promise<void> {
       })
     }
 
+    if (!newContents.length) {
+      return;  // This action is a no-op if there are no changes.
+    }
+
+    const { stdout: commit_sha } = await getExecOutput('git', ['rev-parse', 'HEAD'], {
+      failOnStderr: true
+    });
+
+    const { stdout: base_tree } = await getExecOutput('git', ['rev-parse', `${commit_sha}^{tree}`], {
+      failOnStderr: true
+    });
 
     // Do a dance with the API.
     // ========================
@@ -71,8 +57,6 @@ async function run(): Promise<void> {
 
     const g = octokit.rest.git;
     const ref = `heads/${branchName}`;  // slight discrepancy w/ updateRef docs here
-    const {data: {object: {sha: commit_sha}}} = await g.getRef({owner, repo, ref});
-    const {data: {tree: {sha: base_tree}}} = await g.getCommit({owner, repo, commit_sha});
     const {data: {sha: tree}} = await g.createTree({owner, repo, base_tree, tree: newContents,});
     const {data: {sha}} = await g.createCommit({owner, repo, message, tree, parents: [commit_sha]});
     await g.updateRef({owner, repo, ref, sha,});
